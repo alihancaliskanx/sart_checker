@@ -1,100 +1,74 @@
-# sart_checker
+# SART Checker (Şartname Takip Sistemi)
 
-Teknofest yarisma sayfalarindaki sartname PDF dosyalarini otomatik kontrol edip, degisiklik tespit ettiginde masaustu bildirimi gonderen otomasyon araci.
+Teknofest yarışma şartnamelerini (PDF) otomatik olarak takip eden, değişiklik olduğunda KDE Plasma bildirimleri ile uyaran Bash script ve Systemd servisi.
 
-## Takip Edilen Yarismalar
+## Özellikler
 
-| Yarisma | Dosya Adi |
-|---------|-----------|
-| [Insansiz Su Alti Sistemleri](https://www.teknofest.org/tr/yarismalar/insansiz-su-alti-sistemleri-yarismasi/) | `AUV_REPORT.pdf` |
-| [Insansiz Deniz Araci](https://www.teknofest.org/tr/yarismalar/insansiz-deniz-araci-yarismasi/) | `USV_REPORT.pdf` |
-| [Su Alti Roket](https://www.teknofest.org/tr/yarismalar/su-alti-roket-yarismasi/) | `AUR_REPORT.pdf` |
-
-## Desteklenen Sistemler
-
-| Masaustu | Display Server | Bildirim Altyapisi |
-|----------|---------------|-------------------|
-| KDE Plasma | X11 / Wayland | Plasma Notifications |
-| GNOME | X11 / Wayland | GNOME Shell built-in |
-| XFCE | X11 | xfce4-notifyd |
-| Hyprland | Wayland | dunst / mako / swaync (kullanici kurmali) |
-
-## Bagimliliklar
-
-```bash
-# Arch Linux
-sudo pacman -S curl libnotify coreutils
-
-# Ubuntu / Debian
-sudo apt install curl libnotify-bin coreutils
-
-# Fedora
-sudo dnf install curl libnotify coreutils
-
-# openSUSE
-sudo zypper install curl libnotify-tools coreutils
-```
-
-Hyprland kullanicilari icin bildirim daemon'u gereklidir: `dunst`, `mako` veya `swaync`.
-
-## Dizin Yapisi
-
-```
-sart_checker/
-├── src/check.sh               # Ana kontrol scripti
-├── known/                      # Referans PDF dosyalari (manuel)
-├── recent/                     # Indirilen guncel PDF dosyalari
-├── log/sart_checker.log        # Her calistirmada 1 satirlik ozet
-├── sart_checker.service        # Systemd user servisi
-├── sart_checker.timer          # Systemd zamanlayici
-└── .gitignore
-```
+- **Web Scraping:** Belirtilen URL'lerden güncel PDF linklerini otomatik bulur.
+- **Akıllı İndirme:** User-Agent spoofing ile bot korumasını aşar.
+- **Değişiklik Tespiti:** SHA256 hash kontrolü ile dosya içeriğindeki en ufak değişikliği yakalar.
+- **KDE Entegrasyonu:** `notify-send` ile kritik seviyede masaüstü bildirimi gönderir.
+- **loglama:** Detaylı loglama (`log/sart_checker.log`) yapar.
 
 ## Kurulum
 
-### 1. Ilk calistirma ve referans olusturma
+1. **Gereksinimleri Yükleyin:**
+   Arch Linux için:
+
+   ```bash
+   sudo pacman -S curl grep sed awk libnotify
+   ```
+
+2. **Dizinleri Oluşturun & Yetki Verin:**
+
+   ```bash
+   chmod +x src/check.sh
+   ```
+
+3. **Systemd Servisini Aktif Edin:**
+   Servis dosyalarını user dizinine linkleyin:
+
+   ```bash
+   mkdir -p ~/.config/systemd/user/
+   ln -sf $(pwd)/sart_checker.service ~/.config/systemd/user/
+   ln -sf $(pwd)/sart_checker.timer ~/.config/systemd/user/
+
+   systemctl --user daemon-reload
+   systemctl --user enable --now sart_checker.timer
+   ```
+
+## Kullanım
+
+### İlk Çalıştırma (Referans Dosyaları Oluşturma)
+
+Script ilk çalıştığında `known/` klasörü boş olduğu için uyarı verecektir.
+
+1. Scripti manuel çalıştırın:
+   ```bash
+   ./src/check.sh
+   ```
+2. `recent/` klasörüne inen dosyaları kontrol edin.
+3. Eğer dosyalar doğruysa, referans olarak `known/` klasörüne kopyalayın:
+   ```bash
+   cp recent/*.pdf known/
+   ```
+4. Artık script değişiklikleri bu dosyalara göre kıyaslayacaktır.
+
+### Manuel Kontrol
+
+İstediğiniz zaman scripti elle çalıştırabilirsiniz:
 
 ```bash
-bash src/check.sh
-cp recent/*.pdf known/
+./src/check.sh
 ```
 
-### 2. Systemd timer kurulumu
+### Logları İzleme
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp sart_checker.service sart_checker.timer ~/.config/systemd/user/
-
-# ExecStart yolunu otomatik ayarla
-sed -i "s|ExecStart=.*|ExecStart=$(pwd)/src/check.sh|" \
-    ~/.config/systemd/user/sart_checker.service
-
-systemctl --user daemon-reload
-systemctl --user enable --now sart_checker.timer
+tail -f log/sart_checker.log
 ```
 
-## Durum Kontrolu
+## Yapılandırma
 
-```bash
-systemctl --user status sart_checker.timer
-systemctl --user list-timers sart_checker.timer
-journalctl --user -u sart_checker.service -n 50
-cat log/sart_checker.log
-```
-
-## Calisma Mantigi
-
-1. Teknofest sayfalarindan HTML cekilir, `cdn.teknofest.org` uzerindeki PDF linki ayiklanir.
-2. PDF indirilip `recent/` klasorune kaydedilir.
-3. `known/` klasorundeki referansla SHA-256 karsilastirilir.
-4. Fark varsa tek bir masaustu bildirimi gonderilir.
-5. `log/sart_checker.log` dosyasina 1 satirlik ozet yazilir.
-
-Script, `recent/` dosyasini `known/` uzerine otomatik kopyalamaz. Manuel inceleme yapilana kadar her calistirmada bildirim gondermeye devam eder.
-
-## Devre Disi Birakma
-
-```bash
-systemctl --user stop sart_checker.timer
-systemctl --user disable sart_checker.timer
-```
+`src/check.sh` dosyasında `SOURCES` dizisini düzenleyerek yeni yarışmalar ekleyebilirsiniz.
+Format: `URL|HEDEF_DOSYA_ADI`

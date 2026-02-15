@@ -5,6 +5,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+Environment=DISPLAY=:0
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 ExecStart=/home/sups/Documents/Code/sart_checker/src/check.sh
 StandardOutput=journal

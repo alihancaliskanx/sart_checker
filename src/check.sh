@@ -10,9 +10,7 @@ LOG_DIR="$PROJECT_DIR/log"
 LOG_FILE="$LOG_DIR/sart_checker.log"
 LOG_PREFIX="[sart_checker]"
 
-log_info()  { echo "$LOG_PREFIX [INFO]  $(date '+%Y-%m-%d %H:%M:%S') — $*" >&2; }
-log_warn()  { echo "$LOG_PREFIX [WARN]  $(date '+%Y-%m-%d %H:%M:%S') — $*" >&2; }
-log_error() { echo "$LOG_PREFIX [ERROR] $(date '+%Y-%m-%d %H:%M:%S') — $*" >&2; }
+USER_AGENT="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 SOURCES=(
     "https://www.teknofest.org/tr/yarismalar/insansiz-su-alti-sistemleri-yarismasi/|AUV_REPORT.pdf"
@@ -20,139 +18,160 @@ SOURCES=(
     "https://www.teknofest.org/tr/yarismalar/su-alti-roket-yarismasi/|AUR_REPORT.pdf"
 )
 
-for cmd in curl grep sha256sum; do
-    if ! command -v "$cmd" &>/dev/null; then
-        log_error "'$cmd' bulunamadi."
-        exit 1
-    fi
-done
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-# X11/Wayland/DBUS otomatik tespit (systemd service icinden calisma destegi)
+log_info()  { echo -e "${GREEN}$LOG_PREFIX [INFO]  $(date '+%Y-%m-%d %H:%M:%S') — $*${NC}" | tee -a "$LOG_FILE"; }
+log_warn()  { echo -e "${YELLOW}$LOG_PREFIX [WARN]  $(date '+%Y-%m-%d %H:%M:%S') — $*${NC}" | tee -a "$LOG_FILE"; }
+log_error() { echo -e "${RED}$LOG_PREFIX [ERROR] $(date '+%Y-%m-%d %H:%M:%S') — $*${NC}" | tee -a "$LOG_FILE"; }
+
+check_deps() {
+    local deps=(curl grep sha256sum sed awk notify-send)
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            log_error "'$cmd' komutu bulunamadı. Lütfen yükleyin."
+            exit 1
+        fi
+    done
+}
+
 setup_display_env() {
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && return 0
+
     local uid
     uid="$(id -u)"
 
-    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
-        local dbus_path="/run/user/$uid/bus"
-        [[ -S "$dbus_path" ]] && export DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_path"
-    fi
-
-    if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
-        local wayland_sock
-        wayland_sock=$(find "/run/user/$uid/" -maxdepth 1 -name "wayland-*" -type s 2>/dev/null | head -n 1)
-        if [[ -n "$wayland_sock" ]]; then
-            export WAYLAND_DISPLAY="$(basename "$wayland_sock")"
-            export XDG_RUNTIME_DIR="/run/user/$uid"
-        fi
-    fi
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus"
 
     if [[ -z "${DISPLAY:-}" ]]; then
-        if [[ -d /tmp/.X11-unix ]]; then
-            local x_sock
-            x_sock=$(find /tmp/.X11-unix -name "X*" -type s 2>/dev/null | head -n 1)
-            if [[ -n "$x_sock" ]]; then
-                export DISPLAY=":$(basename "$x_sock" | sed 's/X//')"
-            fi
+        local x_sock
+        x_sock=$(find /tmp/.X11-unix -name "X*" -type s 2>/dev/null | sort | head -n 1)
+        if [[ -n "$x_sock" ]]; then
+            export DISPLAY=":$(basename "$x_sock" | sed 's/X//')"
+        else
+            export DISPLAY=":0"
         fi
     fi
-
-    [[ -z "${XDG_RUNTIME_DIR:-}" ]] && export XDG_RUNTIME_DIR="/run/user/$uid"
-
-    return 0
+    
+    if [[ -z "${XAUTHORITY:-}" ]]; then
+         local xauth_file
+         xauth_file=$(find "/run/user/$uid/" -name "xauth_*" 2>/dev/null | head -n 1) # KDE genelde burada tutar
+         if [[ -n "$xauth_file" ]]; then
+             export XAUTHORITY="$xauth_file"
+         elif [[ -f "$HOME/.Xauthority" ]]; then
+             export XAUTHORITY="$HOME/.Xauthority"
+         fi
+    fi
 }
 
 send_notification() {
-    local title="$1" body="$2"
-
-    if ! command -v notify-send &>/dev/null; then
-        log_warn "notify-send bulunamadi, bildirim sadece log'a yazildi."
-        return 0
-    fi
-
-    if ! notify-send --urgency=critical --app-name="sart_checker" --icon=dialog-warning "$title" "$body" 2>/dev/null; then
-        log_warn "notify-send basarisiz oldu (DISPLAY/DBUS eksik olabilir)"
-        return 0
+    local title="$1"
+    local body="$2"
+    
+    if notify-send --urgency=critical --app-name="sart_checker" --icon=dialog-warning "$title" "$body"; then
+        log_info "Bildirim gönderildi: $title"
+    else
+        log_warn "Bildirim gönderilemedi (DBUS/DISPLAY sorunu olabilir)."
     fi
 }
 
-setup_display_env
-mkdir -p "$RECENT_DIR" "$LOG_DIR"
+main() {
+    check_deps
+    setup_display_env
+    mkdir -p "$RECENT_DIR" "$LOG_DIR" "$KNOWN_DIR"
 
-CHANGED=()
-ERRORS=()
+    log_info "Tarama başlatılıyor..."
 
-for entry in "${SOURCES[@]}"; do
-    URL="${entry%%|*}"
-    FILENAME="${entry##*|}"
+    local changed_files=()
+    local error_files=()
 
-    log_info "Isleniyor: $FILENAME"
+    for entry in "${SOURCES[@]}"; do
+        local url="${entry%%|*}"
+        local filename="${entry##*|}"
+        local recent_file="$RECENT_DIR/$filename"
+        local known_file="$KNOWN_DIR/$filename"
 
-    HTML=""
-    if ! HTML=$(curl -sL --max-time 30 --retry 2 "$URL"); then
-        log_error "HTML cekilemedi: $URL"
-        ERRORS+=("$FILENAME")
-        continue
-    fi
+        log_info "Kontrol ediliyor: $filename ($url)"
 
-    PDF_URL=""
-    PDF_URL=$(echo "$HTML" | grep -oP 'https://cdn\.teknofest\.org/[^"'"'"'\s<>]+\.pdf' | head -n 1)
+        local html_content
+        if ! html_content=$(curl -sL -A "$USER_AGENT" --max-time 30 --retry 2 "$url"); then
+            log_error "Erişim hatası: $url"
+            error_files+=("$filename")
+            continue
+        fi
 
-    if [[ -z "$PDF_URL" ]]; then
-        log_warn "PDF linki bulunamadi: $URL"
-        ERRORS+=("$FILENAME")
-        continue
-    fi
+        local pdf_url=""
+        
+        pdf_url=$(echo "$html_content" | grep -oP 'href=[\"'"'"']\K[^\"'"'"']+/media/upload/[^\"'"'"']+\.pdf' | head -n 1 || true)
+        
+        if [[ -z "$pdf_url" ]]; then
+             pdf_url=$(echo "$html_content" | grep -oP 'href=[\"'"'"']\K[^\"'"'"']+\.pdf' | head -n 1 || true)
+        fi
 
-    RECENT_FILE="$RECENT_DIR/$FILENAME"
+        if [[ -z "$pdf_url" ]]; then
+            log_warn "PDF linki sayfada bulunamadı! ($url)"
+            error_files+=("$filename")
+            continue
+        fi
 
-    if ! curl -sL --max-time 60 --retry 2 -o "$RECENT_FILE" "$PDF_URL"; then
-        log_error "PDF indirilemedi: $PDF_URL"
-        ERRORS+=("$FILENAME")
-        continue
-    fi
+        if [[ "$pdf_url" == /* ]]; then
+            pdf_url="https://www.teknofest.org${pdf_url}"
+        elif [[ "$pdf_url" != http* ]]; then
+             pdf_url="https://www.teknofest.org/${pdf_url}"
+        fi
 
-    if [[ ! -s "$RECENT_FILE" ]]; then
-        log_error "Indirilen dosya bos: $RECENT_FILE"
-        ERRORS+=("$FILENAME")
-        continue
-    fi
+        log_info "PDF Bulundu: $pdf_url"
 
-    log_info "Indirildi: $FILENAME ($(du -h "$RECENT_FILE" | cut -f1))"
+        if ! curl -sL -A "$USER_AGENT" --max-time 60 --retry 2 -o "$recent_file" "$pdf_url"; then
+            log_error "İndirme başarısız: $pdf_url"
+            error_files+=("$filename")
+            continue
+        fi
 
-    KNOWN_FILE="$KNOWN_DIR/$FILENAME"
+        if [[ ! -s "$recent_file" ]]; then
+             log_error "İndirilen dosya 0 byte: $filename"
+             error_files+=("$filename")
+             rm -f "$recent_file"
+             continue
+        fi
 
-    if [[ ! -f "$KNOWN_FILE" ]]; then
-        log_warn "Referans dosya yok: $FILENAME"
-        continue
-    fi
+        if [[ ! -f "$known_file" ]]; then
+            log_warn "Referans dosya ($filename) 'known/' klasöründe yok. İlk kez çalışıyor olabilir."
+            log_info "Lütfen '$recent_file' dosyasını inceleyip '$known_file' olarak kaydedin."
+            continue
+        fi
 
-    HASH_KNOWN=$(sha256sum "$KNOWN_FILE" | awk '{print $1}')
-    HASH_RECENT=$(sha256sum "$RECENT_FILE" | awk '{print $1}')
+        local hash_known
+        local hash_recent
+        hash_known=$(sha256sum "$known_file" | awk '{print $1}')
+        hash_recent=$(sha256sum "$recent_file" | awk '{print $1}')
 
-    if [[ "$HASH_KNOWN" != "$HASH_RECENT" ]]; then
-        log_warn "DEGISIKLIK: $FILENAME"
-        CHANGED+=("$FILENAME")
+        if [[ "$hash_known" != "$hash_recent" ]]; then
+            log_warn "⚠️ DEĞİŞİKLİK TESPİT EDİLDİ: $filename"
+            changed_files+=("$filename")
+        else
+            log_info "Dosya güncel: $filename"
+        fi
+    done
+
+    if [[ ${#changed_files[@]} -gt 0 ]]; then
+        local msg_list=$(printf ", %s" "${changed_files[@]}")
+        msg_list="${msg_list:2}"
+        
+        send_notification "⚠️ Şartname Değişikliği Tespit Edildi!" "Değişen dosyalar: $msg_list\nLütfen 'known/' klasörünü güncelleyin."
+        log_warn "DEĞİŞENLER: $msg_list"
     else
-        log_info "Degisiklik yok: $FILENAME"
+        log_info "Hiçbir değişiklik tespit edilmedi."
     fi
-done
 
-if [[ ${#CHANGED[@]} -gt 0 ]]; then
-    CHANGED_LIST=$(printf ", %s" "${CHANGED[@]}")
-    CHANGED_LIST="${CHANGED_LIST:2}"
+    if [[ ${#error_files[@]} -gt 0 ]]; then
+        local err_list=$(printf ", %s" "${error_files[@]}")
+        log_error "Hata alınan dosyalar: ${err_list:2}"
+    fi
 
-    send_notification "Sartname Degisikligi Tespit Edildi" "Degisen dosyalar: $CHANGED_LIST"
-    log_warn "Degisen: $CHANGED_LIST"
-fi
+    log_info "İşlem tamamlandı."
+}
 
-if [[ ${#ERRORS[@]} -gt 0 ]]; then
-    ERROR_LIST=$(printf ", %s" "${ERRORS[@]}")
-    ERROR_LIST="${ERROR_LIST:2}"
-    log_error "Hatali kaynaklar: $ERROR_LIST"
-fi
-
-# log/ dizinine 1 satirlik ozet yaz
-SUMMARY="$(date '+%Y-%m-%d %H:%M:%S') | changed=${#CHANGED[@]} errors=${#ERRORS[@]} sources=${#SOURCES[@]}"
-echo "$SUMMARY" >> "$LOG_FILE"
-
-log_info "Tamamlandi."
+main
